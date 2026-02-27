@@ -1,0 +1,29 @@
+name: Daily Stock Report (DeepSeek)
+
+on:
+  schedule:
+    # 每天 UTC 时间 23:00 运行 = 北京时间 次日 07:00
+    - cron: '0 23 * * *'
+  workflow_dispatch: # 允许手动点击按钮测试
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          pip install yfinance requests
+      
+      - name: Run Script
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
+        run: python report.py
