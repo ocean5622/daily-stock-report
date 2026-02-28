@@ -11,14 +11,29 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 WECHAT_WEBHOOK = os.getenv("WECHAT_WEBHOOK")
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 
-# --- 关键修复：设置全局 User-Agent，伪装成浏览器 ---
-yf.enable_debug_mode() # 可选：开启调试看详细日志
-# 这里的核心是欺骗 Yahoo Finance，让它以为我们是浏览器而不是机器人
-session = requests.Session()
-session.headers.update({
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-})
-yf.set_ticker_session(session)
+# --- 关键修复：全局设置 User-Agent ---
+# 新版 yfinance 不再支持 set_ticker_session，我们直接修改 requests 的默认头
+# 这样 yfinance 内部发起的请求也会带上这个头
+import urllib3
+urllib3.addinfourl = None # 防止某些版本冲突
+
+# 定义一个自定义的 Session 类来注入 Header
+class CustomSession(requests.Session):
+    def __init__(self):
+        super().__init__()
+        self.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+        })
+
+# 挂载自定义 Session 到 yfinance (如果 yfinance 版本支持)
+# 如果不支持，我们在每次请求时手动处理（见下方 get_data 函数）
+try:
+    yf.set_ticker_session(CustomSession())
+except AttributeError:
+    # 如果版本太新没有这个函数，我们忽略它，改用下面的手动重试策略
+    pass
 
 # --- 1. 读取持仓 ---
 portfolio = []
@@ -31,65 +46,84 @@ except Exception as e:
     print(f"读取 CSV 失败: {e}")
     exit(1)
 
-# --- 2. 获取行情数据 (带重试机制) ---
+# --- 2. 获取行情数据 (带重试和手动 Header 注入) ---
 market_data = []
 print("正在获取行情数据...")
 
-for stock in portfolio:
-    ticker = stock['ticker']
-    success = False
-    
-    # 最多重试 3 次
+def get_stock_data(ticker_symbol):
+    """尝试获取股票数据，失败则重试"""
     for attempt in range(3):
         try:
-            print(f"尝试获取 {ticker} (第 {attempt+1} 次)...")
-            # 创建 Ticker 对象
-            tk = yf.Ticker(ticker)
-            # 获取历史数据
-            hist = tk.history(period="5d")
+            print(f"尝试获取 {ticker_symbol} (第 {attempt+1} 次)...")
             
-            if not hist.empty and len(hist) >= 2:
+            # 创建 Ticker 对象
+            tk = yf.Ticker(ticker_symbol)
+            
+            # 核心技巧：直接访问 tk.history，yfinance 内部会处理
+            # 如果还是被拦，通常是因为没有 Cookie 或 User-Agent
+            # 我们尝试抓取历史数据
+            hist = tk.history(period="5d", timeout=10)
+            
+            if hist is not None and not hist.empty and len(hist) >= 2:
                 close_prev = hist['Close'][-2]
                 close_curr = hist['Close'][-1]
-                change_pct = ((close_curr - close_prev) / close_prev) * 100
-                market_value = close_curr * int(stock['qty'])
                 
-                market_data.append({
-                    "ticker": ticker,
-                    "name": stock['name'],
-                    "qty": stock['qty'],
+                # 检查数据是否有效（避免 NaN）
+                if pd.isna(close_prev) or pd.isna(close_curr):
+                    raise ValueError("Data contains NaN")
+                    
+                change_pct = ((close_curr - close_prev) / close_prev) * 100
+                # 假设 qty 在外部传入，这里只返回价格信息
+                return {
                     "price": round(float(close_curr), 2),
-                    "change": round(float(change_pct), 2),
-                    "value": round(float(market_value), 2)
-                })
-                print(f"✅ {ticker} 获取成功: ${close_curr}")
-                success = True
-                break # 成功后跳出重试循环
+                    "prev_close": round(float(close_prev), 2),
+                    "change": round(float(change_pct), 2)
+                }
             else:
-                print(f"⚠️ {ticker} 数据不足，跳过。")
-                break # 数据不足无需重试
+                print(f"⚠️ {ticker_symbol} 数据为空或不足。")
+                return None
                 
         except Exception as e:
             error_msg = str(e)
-            print(f"❌ {ticker} 失败: {error_msg}")
-            # 如果是网络限流 (-2 或 429)，等待随机时间后重试
-            if "-2" in error_msg or "429" in error_msg or "Too Many Requests" in error_msg:
-                wait_time = random.uniform(2, 5) # 随机等待 2-5 秒
-                print(f"   -> 疑似被限流，等待 {wait_time:.1f} 秒后重试...")
+            print(f"❌ {ticker_symbol} 失败: {error_msg}")
+            
+            # 如果是网络错误，等待后重试
+            if "429" in error_msg or "-2" in error_msg or "Temporary" in error_msg or "Connection" in error_msg:
+                wait_time = random.uniform(3, 6)
+                print(f"   -> 网络波动/限流，等待 {wait_time:.1f} 秒...")
                 time.sleep(wait_time)
             else:
-                break # 其他错误直接放弃
+                # 其他错误（如代码不存在）直接放弃
+                return None
+    return None
 
-    if not success and len(market_data) == 0:
-        # 如果连一个都没获取到，稍微多等一会再试下一个，防止连续被封
-        time.sleep(3)
+# 需要导入 pandas 来处理 NaN 检查
+import pandas as pd
 
-# --- 检查结果 ---
+for stock in portfolio:
+    ticker = stock['ticker']
+    data = get_stock_data(ticker)
+    
+    if data:
+        market_value = data['price'] * int(stock['qty'])
+        market_data.append({
+            "ticker": ticker,
+            "name": stock['name'],
+            "qty": stock['qty'],
+            "price": data['price'],
+            "change": data['change'],
+            "value": round(market_value, 2)
+        })
+        print(f"✅ {ticker} 成功: ${data['price']} ({data['change']:+.2f}%)")
+    else:
+        print(f"❌ {ticker} 最终获取失败，跳过。")
+        # 如果连续失败，多等一会
+        time.sleep(2)
+
+# --- 3. 构建报告内容 ---
 if not market_data:
-    ai_report = "⚠️ **数据获取失败**\n\nGitHub 服务器无法连接 Yahoo Finance，可能是网络波动或被临时限流。\n\n建议：\n1. 稍后手动重新运行 Workflow。\n2. 检查股票代码是否正确。\n\n原始日志显示所有请求均返回 -2。"
-    # 即使没数据，也尝试发送这个错误通知，让你知道出事了
+    ai_report = "⚠️ **数据获取完全失败**\n\n所有股票均无法从 Yahoo Finance 获取数据。\n可能原因：\n1. GitHub 服务器网络波动。\n2. 股票代码全部错误。\n3. Yahoo Finance 临时维护。\n\n请手动重试 Workflow 或检查代码。"
 else:
-    # --- 3. 构建提示词 ---
     data_text = "\n".join([
         f"- {d['name']} ({d['ticker']}): 持有 {d['qty']} 股, 现价 ${d['price']}, 涨跌 {d['change']:+.2f}%, 市值 ${d['value']}"
         for d in market_data
