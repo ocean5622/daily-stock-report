@@ -1,39 +1,251 @@
 import os
 import csv
 import requests
-import yfinance as yf
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 import random
+from dotenv import load_dotenv
+
+# 加载 .env 文件中的环境变量
+load_dotenv()
 
 # --- 配置 ---
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 WECHAT_WEBHOOK = os.getenv("WECHAT_WEBHOOK")
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 
-# --- 关键修复：全局设置 User-Agent ---
-# 新版 yfinance 不再支持 set_ticker_session，我们直接修改 requests 的默认头
-# 这样 yfinance 内部发起的请求也会带上这个头
-import urllib3
-urllib3.addinfourl = None # 防止某些版本冲突
+# --- API提供商配置 ---
+# Alpha Vantage API
+ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "your_alpha_vantage_key_here")
+ALPHA_VANTAGE_BASE_URL = "https://www.alphavantage.co/query"
 
-# 定义一个自定义的 Session 类来注入 Header
-class CustomSession(requests.Session):
-    def __init__(self):
-        super().__init__()
-        self.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
-        })
+# 新闻搜索相关
+import json
+from urllib.parse import urlencode
 
-# 挂载自定义 Session 到 yfinance (如果 yfinance 版本支持)
-# 如果不支持，我们在每次请求时手动处理（见下方 get_data 函数）
-try:
-    yf.set_ticker_session(CustomSession())
-except AttributeError:
-    # 如果版本太新没有这个函数，我们忽略它，改用下面的手动重试策略
-    pass
+# 固定使用 Alpha Vantage
+STOCK_API_PROVIDER = "alpha_vantage"
+
+def get_stock_data_alpha_vantage(ticker_symbol):
+    """通过Alpha Vantage API获取股票数据"""
+    url = f"{ALPHA_VANTAGE_BASE_URL}?function=GLOBAL_QUOTE&symbol={ticker_symbol}&apikey={ALPHA_VANTAGE_API_KEY}"
+
+    try:
+        response = requests.get(url, timeout=30)
+        if response.status_code == 200:
+            data = response.json()
+            quote = data.get("Global Quote")
+            if quote:
+                current_price = float(quote.get("05. price", 0))
+                prev_close = float(quote.get("08. previous close", 0))
+
+                if current_price > 0 and prev_close > 0:
+                    change_pct = ((current_price - prev_close) / prev_close) * 100
+                    return {
+                        "price": round(current_price, 2),
+                        "prev_close": round(prev_close, 2),
+                        "change": round(change_pct, 2)
+                    }
+        elif response.status_code == 429:
+            print("   -> Alpha Vantage API速率限制")
+            time.sleep(60)  # Alpha Vantage免费版每分钟最多5次请求
+        else:
+            print(f"   -> Alpha Vantage API错误: {response.status_code}")
+    except Exception as e:
+        print(f"   -> Alpha Vantage请求失败: {str(e)}")
+
+    return None
+
+def get_stock_data(ticker_symbol):
+    """获取股票数据 - 只使用 Alpha Vantage"""
+    print(f"正在获取 {ticker_symbol} 的数据 - 使用 Alpha Vantage API")
+
+    result = get_stock_data_alpha_vantage(ticker_symbol)
+
+    if result:
+        return result
+    else:
+        wait_time = random.uniform(10, 20)
+        print(f"   -> 等待 {wait_time:.1f} 秒后重试...")
+        time.sleep(wait_time)
+
+        # 重试一次
+        return get_stock_data_alpha_vantage(ticker_symbol)
+
+def search_news_for_stocks(portfolio_data):
+    """搜索每只股票当天的股市变动相关资讯 - 每只股票最多搜索2次"""
+    news_data = {}
+    print("正在搜索相关股票新闻...")
+
+    # 获取今天的日期
+    today = datetime.now().strftime("%Y-%m-%d")
+    print(f"正在搜索 {today} 的股市变动相关资讯...")
+
+    for stock in portfolio_data:
+        ticker = stock['ticker']
+        name = stock['name']
+        print(f"正在为 {ticker} ({name}) 搜索当天股市变动相关资讯...")
+
+        found_articles = []
+        attempts = 0
+        max_attempts = 2  # 每只股票最多搜索2次
+
+        # 尽量只进行一次有效查询
+        while attempts < max_attempts and len(found_articles) == 0:
+            attempts += 1
+            print(f"  第 {attempts} 次搜索 {ticker}...")
+
+            # 统一使用综合性的查询策略，增加首次成功概率
+            if attempts == 1:
+                # 第一次搜索：综合性查询策略，覆盖价格变动、市场新闻、交易量、盈利报告等多个方面
+                query = f"{ticker} {name} stock price change market news trading volume earnings financial report today"
+            else:
+                # 第二次搜索（后备）：更广泛的行业和市场影响
+                query = f"{ticker} {name} trading volume earnings news today"
+
+            try:
+                params = {
+                    "engine": "google",
+                    "q": query,
+                    "api_key": os.getenv("SERPAPI_API_KEY"),
+                    "gl": "US",
+                    "hl": "en",
+                    "num": 3,
+                    "tbs": f"qdr:d"  # 限制为今天(today)的新闻
+                }
+
+                # 构造API URL
+                base_url = "https://serpapi.com/search"
+                query_string = urlencode(params)
+                search_url = f"{base_url}?{query_string}"
+
+                response = requests.get(search_url, timeout=30)
+                if response.status_code == 200:
+                    results = response.json()
+
+                    # 提取新闻结果
+                    if "organic_results" in results:
+                        articles = results["organic_results"]
+
+                        # 查找与该股票相关的新闻
+                        for article in articles:
+                            title = article.get("title", "")
+                            snippet = article.get("snippet", "")
+                            link = article.get("link", "")
+                            source = article.get("source", "Unknown Source")
+
+                            # 检查标题或摘要是否提及该股票或相关关键词
+                            ticker_mentioned = (ticker.lower() in title.lower() or
+                                              ticker.lower() in snippet.lower() or
+                                              name.split()[0].lower() in title.lower() or
+                                              name.split()[0].lower() in snippet.lower())
+
+                            # 检查是否涉及股市变动、价格变动等相关关键词
+                            market_related = any(keyword in title.lower() or keyword in snippet.lower()
+                                               for keyword in ["stock", "price", "trading", "market",
+                                                             "earnings", "report", "financial",
+                                                             "investor", "shares", "valuation",
+                                                             "bull", "bear", "gains", "losses",
+                                                             "up", "down", "rise", "fall", "change"])
+
+                            # 只有当提及股票且与股市相关时才添加
+                            if title and snippet and ticker_mentioned and market_related:
+                                article_obj = {
+                                    "title": title,
+                                    "snippet": snippet,
+                                    "link": link,
+                                    "source": source,
+                                    "query_used": query
+                                }
+
+                                # 避免重复添加相同的文章
+                                if article_obj not in found_articles:
+                                    found_articles.append(article_obj)
+
+                        if found_articles:
+                            print(f"  第 {attempts} 次搜索找到 {len(found_articles)} 条相关资讯")
+                        else:
+                            print(f"  第 {attempts} 次搜索未找到相关资讯")
+
+                else:
+                    print(f"  搜索 {ticker} 新闻时HTTP错误: {response.status_code}")
+
+            except Exception as e:
+                print(f"  搜索 {ticker} 新闻时出错: {str(e)}")
+
+            # 在两次搜索之间稍作停顿，避免API限制
+            if attempts < max_attempts:
+                time.sleep(2)
+
+        # 存储找到的资讯，如果没有找到则标记
+        if found_articles:
+            # 每只股票最多存储2条最有价值的新闻
+            news_data[ticker] = found_articles[:2]
+        else:
+            # 如果没有找到任何相关信息，记录状态
+            news_data[ticker] = [{
+                "title": "当天无相关资讯",
+                "snippet": f"未能找到{ticker}在{today}的相关股市变动资讯",
+                "link": "",
+                "source": "System",
+                "query_used": "None"
+            }]
+
+    return news_data
+
+def format_news_summary(news_data):
+    """格式化新闻摘要"""
+    if not news_data:
+        return "未能获取相关新闻信息。"
+
+    news_summary = "🔍 **相关新闻资讯**\n\n"
+
+    for ticker, articles in news_data.items():
+        news_summary += f"📌 **{ticker} 重要新闻**:\n"
+        for i, article in enumerate(articles[:2], 1):  # 每只股票最多显示2条新闻
+            if article['title'] not in ["昨夜无重要新闻", "新闻搜索失败", "未搜索"]:
+                importance_mark = "🔥" if article.get('is_important', False) else "📰"
+                news_summary += f"  {i}. {importance_mark}【{article['source']}】{article['title']}\n"
+                news_summary += f"     📝 {article['snippet']}\n"
+                if article['link']:
+                    news_summary += f"     🔗 {article['link']}\n"
+                news_summary += "\n"
+            else:
+                news_summary += f"  {i}. {article['snippet']}\n\n"
+        news_summary += "\n"
+
+    return news_summary
+
+def format_portfolio_ui(market_data):
+    """格式化投资组合UI显示（适用于即时通讯软件）"""
+    if not market_data:
+        return "没有可用的持仓数据。"
+
+    ui_output = "💼 **投资组合概览**\n\n"
+
+    for stock in market_data:
+        # 确定涨跌符号和颜色
+        change = stock['change']
+        change_str = f"{change:+.2f}%"
+        emoji = "📈" if change >= 0 else "📉"
+
+        # 使用颜色emoji表示涨跌：绿色表示上涨，红色表示下跌
+        color_indicator = "🟢" if change >= 0 else "🔴"
+
+        ui_output += (
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{emoji} **{stock['ticker']}** - {stock['name']}\n"
+            f"📊 持有: {stock['qty']} 股  |  💰 当价: ${stock['price']}\n"
+            f"🗓️ 昨收: ${stock['prev_close']}  |  {color_indicator} 涨跌: {change_str}\n"
+            f"🏦 市值: ${stock['value']}\n"
+        )
+
+    # 添加总计信息
+    total_value = sum(d['value'] for d in market_data)
+    ui_output += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    ui_output += f"📈 **总市值: ${total_value:,.2f}**\n\n"
+
+    return ui_output
 
 # --- 1. 读取持仓 ---
 portfolio = []
@@ -43,67 +255,20 @@ try:
         for row in reader:
             portfolio.append(row)
 except Exception as e:
-    print(f"读取 CSV 失败: {e}")
+    print(f"错误：读取 CSV 失败: {e}")
     exit(1)
 
-# --- 2. 获取行情数据 (带重试和手动 Header 注入) ---
+# --- 2. 获取行情数据 ---
 market_data = []
-print("正在获取行情数据...")
+print("正在使用 Alpha Vantage API 获取行情数据...")
 
-def get_stock_data(ticker_symbol):
-    """尝试获取股票数据，失败则重试"""
-    for attempt in range(3):
-        try:
-            print(f"尝试获取 {ticker_symbol} (第 {attempt+1} 次)...")
-            
-            # 创建 Ticker 对象
-            tk = yf.Ticker(ticker_symbol)
-            
-            # 核心技巧：直接访问 tk.history，yfinance 内部会处理
-            # 如果还是被拦，通常是因为没有 Cookie 或 User-Agent
-            # 我们尝试抓取历史数据
-            hist = tk.history(period="5d", timeout=10)
-            
-            if hist is not None and not hist.empty and len(hist) >= 2:
-                close_prev = hist['Close'][-2]
-                close_curr = hist['Close'][-1]
-                
-                # 检查数据是否有效（避免 NaN）
-                if pd.isna(close_prev) or pd.isna(close_curr):
-                    raise ValueError("Data contains NaN")
-                    
-                change_pct = ((close_curr - close_prev) / close_prev) * 100
-                # 假设 qty 在外部传入，这里只返回价格信息
-                return {
-                    "price": round(float(close_curr), 2),
-                    "prev_close": round(float(close_prev), 2),
-                    "change": round(float(change_pct), 2)
-                }
-            else:
-                print(f"⚠️ {ticker_symbol} 数据为空或不足。")
-                return None
-                
-        except Exception as e:
-            error_msg = str(e)
-            print(f"❌ {ticker_symbol} 失败: {error_msg}")
-            
-            # 如果是网络错误，等待后重试
-            if "429" in error_msg or "-2" in error_msg or "Temporary" in error_msg or "Connection" in error_msg:
-                wait_time = random.uniform(3, 6)
-                print(f"   -> 网络波动/限流，等待 {wait_time:.1f} 秒...")
-                time.sleep(wait_time)
-            else:
-                # 其他错误（如代码不存在）直接放弃
-                return None
-    return None
-
-# 需要导入 pandas 来处理 NaN 检查
-import pandas as pd
-
-for stock in portfolio:
+# 逐个获取股票数据
+for i, stock in enumerate(portfolio):
     ticker = stock['ticker']
+    print(f"正在处理 {ticker} ({stock['name']}) - {i+1}/{len(portfolio)}")
+
     data = get_stock_data(ticker)
-    
+
     if data:
         market_value = data['price'] * int(stock['qty'])
         market_data.append({
@@ -111,42 +276,64 @@ for stock in portfolio:
             "name": stock['name'],
             "qty": stock['qty'],
             "price": data['price'],
+            "prev_close": data['prev_close'],
             "change": data['change'],
             "value": round(market_value, 2)
         })
-        print(f"✅ {ticker} 成功: ${data['price']} ({data['change']:+.2f}%)")
+        print(f"成功：{ticker} - ${data['price']} ({data['change']:+.2f}%)")
     else:
-        print(f"❌ {ticker} 最终获取失败，跳过。")
-        # 如果连续失败，多等一会
-        time.sleep(2)
+        print(f"失败：{ticker} 获取数据失败，跳过。")
 
-# --- 3. 构建报告内容 ---
+    # 在每个请求之间添加延迟以避免过于频繁的请求
+    if i < len(portfolio) - 1:  # 不在最后一个元素后等待
+        delay = random.uniform(12, 18)  # 减少延迟以降低总等待时间
+        print(f"   -> 等待 {delay:.1f} 秒后继续下一个请求...")
+        time.sleep(delay)
+
+# --- 3. 获取相关新闻 ---
+news_data = {}
+if market_data:
+    print("正在获取相关新闻信息...")
+    news_data = search_news_for_stocks(market_data)
+
+# --- 4. 构建报告内容 ---
 if not market_data:
-    ai_report = "⚠️ **数据获取完全失败**\n\n所有股票均无法从 Yahoo Finance 获取数据。\n可能原因：\n1. GitHub 服务器网络波动。\n2. 股票代码全部错误。\n3. Yahoo Finance 临时维护。\n\n请手动重试 Workflow 或检查代码。"
+    ai_report = f"""⚠️ **数据获取完全失败**
+
+所有股票均无法从 Alpha Vantage API 获取数据。
+可能原因：
+1. 网络连接问题。
+2. 所有股票代码无效或不存在。
+3. API密钥缺失或无效。
+4. API配额已用尽。
+5. API提供商临时服务问题。
+
+请检查您的 Alpha Vantage API 密钥和配额。"""
 else:
-    data_text = "\n".join([
-        f"- {d['name']} ({d['ticker']}): 持有 {d['qty']} 股, 现价 ${d['price']}, 涨跌 {d['change']:+.2f}%, 市值 ${d['value']}"
-        for d in market_data
-    ])
-    total_value = sum(d['value'] for d in market_data)
-    today_str = datetime.now().strftime("%Y年%m月%d日")
+    # 格式化投资组合UI
+    portfolio_ui = format_portfolio_ui(market_data)
+
+    # 添加新闻信息到提示词
+    news_summary = format_news_summary(news_data)
 
     prompt = f"""
-    你是一位专业的美股投资顾问。请根据以下数据，为我生成一份【{today_str}】的美股晨报。
+    你是一位专业的美股投资顾问。请根据以下数据和新闻信息，为我生成一份【{datetime.now().strftime('%Y年%m月%d日')}】的美股晨报。
 
-    我的持仓数据：
-    {data_text}
-    总市值约为：${total_value:.2f}
+    {portfolio_ui}
+
+    {news_summary}
 
     要求：
-    1. **总览**：一句话总结昨夜整体市场表现。
-    2. **个股点评**：对每只股票简要分析涨跌原因。
-    3. **操作建议**：给出简短建议（持有/减仓/关注）。
-    4. **风格**：专业、简洁，直接说结论。
-    5. **格式**：使用 Markdown 格式。
+    1. **市场总览**：一句话总结昨夜整体市场表现。
+    2. **个股点评**：对每只股票结合新闻信息简要分析涨跌原因。
+    3. **新闻影响**：分析新闻对各股票价格变动的可能影响。
+    4. **操作建议**：基于数据分析和新闻信息给出具体操作建议（持有/减仓/加仓/关注）。
+    5. **风险提示**：指出可能影响投资决策的风险因素。
+    6. **风格**：专业、简洁，直接说结论。
+    7. **格式**：使用 Markdown 格式，适合在即时通讯软件中阅读，使用适当的emoji和分隔符。
     """
 
-    # --- 4. 调用 DeepSeek API ---
+    # --- 5. 调用 DeepSeek AI ---
     print("正在请求 DeepSeek AI...")
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
@@ -156,7 +343,7 @@ else:
         "model": "deepseek-chat",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.7,
-        "max_tokens": 1000
+        "max_tokens": 1500
     }
 
     ai_report = ""
@@ -165,9 +352,9 @@ else:
         response.raise_for_status()
         ai_report = response.json()['choices'][0]['message']['content']
     except Exception as e:
-        ai_report = f"⚠️ AI 分析失败：{str(e)}\n\n原始数据:\n{data_text}"
+        ai_report = f"⚠️ AI 分析失败：{str(e)}\n\n{format_portfolio_ui(market_data)}\n\n新闻信息:\n{format_news_summary(news_data)}"
 
-# --- 5. 推送到企业微信 ---
+# --- 6. 推送到企业微信 ---
 print("正在发送消息...")
 if len(ai_report) > 3800:
     ai_report = ai_report[:3800] + "\n...(内容过长)"
@@ -175,15 +362,15 @@ if len(ai_report) > 3800:
 wechat_payload = {
     "msgtype": "markdown",
     "markdown": {
-        "content": f"### 🇺🇸 美股晨报\n📅 日期：{datetime.now().strftime('%Y-%m-%d')}\n\n{ai_report}"
+        "content": f"🇺🇸 **美股晨报**\n📅 日期：{datetime.now().strftime('%Y-%m-%d')}\n\n{ai_report}"
     }
 }
 
 try:
     resp = requests.post(WECHAT_WEBHOOK, json=wechat_payload, timeout=10)
     if resp.status_code == 200:
-        print("✅ 发送成功！")
+        print("[OK] 发送成功！")
     else:
-        print(f"❌ 发送失败: {resp.text}")
+        print(f"[ERR] 发送失败: {resp.text}")
 except Exception as e:
-    print(f"❌ 网络错误: {e}")
+    print(f"[ERR] 网络错误: {e}")
