@@ -9,10 +9,10 @@ from dotenv import load_dotenv
 # # 加载 .env 文件中的环境变量
 # load_dotenv()
 
-# # --- 配置 ---
-# DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-# WECHAT_WEBHOOK = os.getenv("WECHAT_WEBHOOK")
-# DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
+# --- 配置 ---
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+WECHAT_WEBHOOK = os.getenv("WECHAT_WEBHOOK")
+DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 
 # --- API提供商配置 ---
 # Alpha Vantage API
