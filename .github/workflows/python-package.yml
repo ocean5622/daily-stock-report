@@ -1,0 +1,33 @@
+name: Test WeChat Work Notification
+
+on:
+  workflow_dispatch:  # 允许手动触发
+  # push:             # 也可以取消注释，测试提交代码时触发
+
+jobs:
+  send-message:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Message to WeChat Work
+        run: |
+          # 定义变量
+          WEBHOOK_URL="${{ secrets.WECHAT_WEBHOOK }}"
+          
+          # 构造 JSON 消息体 (注意：text 内容必须包含你在企微设置的关键词，如 "测试")
+          # 这里使用 curl 发送 POST 请求
+          curl -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "msgtype": "text",
+              "text": {
+                "content": "🚀 [GitHub Actions 测试] \n\n你好，这是一条测试消息。\n如果看到这条消息，说明连接成功！\n\n关键词：测试 \n时间: '"$(date)"'
+              }
+            }'
+          
+          # 检查返回状态
+          if [ $? -eq 0 ]; then
+            echo "✅ 消息发送请求已发出"
+          else
+            echo "❌ 发送失败"
+            exit 1
+          fi
