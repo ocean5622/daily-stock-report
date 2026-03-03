@@ -7,7 +7,7 @@ import random
 from dotenv import load_dotenv
 
 # 加载 .env 文件中的环境变量
-load_dotenv()
+#load_dotenv()
 
 # --- 配置 ---
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
@@ -374,3 +374,13 @@ try:
         print(f"[ERR] 发送失败: {resp.text}")
 except Exception as e:
     print(f"[ERR] 网络错误: {e}")
+
+# --- 7. 打印晨报内容 ---
+print("\n" + "="*60)
+print("📰 今日晨报内容：")
+print("="*60)
+print(f"🇺🇸 **美股晨报**")
+print(f"📅 日期：{datetime.now().strftime('%Y-%m-%d')}")
+print("-"*60)
+print(ai_report)
+print("="*60)
