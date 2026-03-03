@@ -7,7 +7,7 @@ import random
 from dotenv import load_dotenv
 
 # 加载 .env 文件中的环境变量
-#load_dotenv()
+load_dotenv()
 
 # --- 配置 ---
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
@@ -368,8 +368,14 @@ wechat_payload = {
 
 try:
     resp = requests.post(WECHAT_WEBHOOK, json=wechat_payload, timeout=10)
+    print(f"[DEBUG] HTTP状态码: {resp.status_code}")
+    print(f"[DEBUG] 响应内容: {resp.text}")
     if resp.status_code == 200:
-        print("[OK] 发送成功！")
+        result = resp.json()
+        if result.get("errcode") == 0:
+            print("[OK] 发送成功！")
+        else:
+            print(f"[ERR] 发送失败: errcode={result.get('errcode')}, errmsg={result.get('errmsg')}")
     else:
         print(f"[ERR] 发送失败: {resp.text}")
 except Exception as e:
