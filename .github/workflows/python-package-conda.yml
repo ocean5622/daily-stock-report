@@ -1,0 +1,84 @@
+name: ⏰ 定时任务验证测试 (纯 Bash 版)
+
+on:
+  # 1. 定时触发设置 (用于验证自动执行)
+  schedule:
+    # 语法：分 时 日 月 周 (UTC 时间)
+    # 下面这行表示：每 5 分钟执行一次 (适合短时间测试，测完记得关掉！)
+    # 如果你想测试特定时间点，可以改成具体 cron，例如 '0 23 * * *'
+    - cron: '*/1 * * * *' 
+  
+  # 2. 手动触发 (推荐：随时点击按钮测试)
+  workflow_dispatch:
+    inputs:
+      test_message:
+        description: '自定义测试消息 (可选)'
+        required: false
+        default: '手动触发测试'
+
+jobs:
+  verify-schedule:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 步骤 1: 打印开始信息
+      - name: 🚀 开始验证
+        run: |
+          echo "========================================"
+          echo "🕒 当前 UTC 时间: $(date -u)"
+          echo "🇨🇳 当前北京时间: $(date -u --date='8 hours')"
+          echo "📝 触发方式: ${{ github.event_name }}"
+          echo "========================================"
+
+      # 步骤 2: 准备消息内容
+      - name: 📝 准备消息内容
+        id: prepare_msg
+        run: |
+          # 获取北京时间
+          BEIJING_TIME=$(date -u --date='8 hours' +"%Y-%m-%d %H:%M:%S")
+          
+          # 判断是手动还是自动
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            MSG_CONTENT="🔔 [手动测试] 你好！这是手动触发的测试。\n用户输入：${{ github.event.inputs.test_message }}\n⏰ 北京时间：$BEIJING_TIME"
+          else
+            MSG_CONTENT="⏰ [自动定时] 滴答滴答！这是自动触发的测试。\n✅ 证明 Cron 配置生效了！\n⏰ 北京时间：$BEIJING_TIME\n📅 星期：$(date -u --date='8 hours' +%A)"
+          fi
+          
+          # 输出变量供下一步使用
+          echo "msg_content=$MSG_CONTENT" >> $GITHUB_OUTPUT
+
+      # 步骤 3: 发送企业微信消息
+      - name: 📤 发送企微通知
+        run: |
+          # 检查 Webhook 是否存在
+          if [ -z "${{ secrets.WECHAT_WEBHOOK }}" ]; then
+            echo "❌ 错误：未找到 WECHAT_WEBHOOK Secret！请去 Settings -> Secrets 配置。"
+            exit 1
+          fi
+
+          # 构造 JSON (注意转义)
+          # 我们强制在消息末尾加上 "测试" 关键词，防止被拦截
+          FULL_CONTENT="${{ steps.prepare_msg.outputs.msg_content }}\n\n[关键词：测试]"
+          
+          echo "正在发送消息..."
+          RESPONSE=$(curl -s -X POST "${{ secrets.WECHAT_WEBHOOK }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"msgtype\": \"text\",
+              \"text\": {
+                \"content\": \"$FULL_CONTENT\"
+              }
+            }")
+          
+          echo "企微返回结果: $RESPONSE"
+          
+          # 简单检查是否成功
+          if echo "$RESPONSE" | grep -q '"errcode":0'; then
+            echo "✅ 消息发送成功！"
+          else
+            echo "⚠️ 发送可能失败，请检查上方返回的 JSON。"
+          fi
+
+      # 步骤 4: 结束
+      - name: ✅ 完成
+        run: echo "🎉 验证流程结束！"
