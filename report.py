@@ -193,6 +193,166 @@ def search_news_for_stocks(portfolio_data):
 
     return news_data
 
+def search_sector_news():
+    """搜索昨夜今晨涨跌板块相关新闻 - 使用 1-2 次 SERPAPI 搜索"""
+    print("正在搜索昨夜今晨涨跌板块相关新闻...")
+
+    sector_news = {
+        "rising_sectors": [],
+        "falling_sectors": []
+    }
+
+    # 第一次搜索：查找昨夜今晨上涨和下跌的板块信息
+    queries = [
+        "US stock market sectors rise today gain leaders overnight performance",
+        "US stock market sectors fall today decline losers overnight performance"
+    ]
+
+    for i, query in enumerate(queries, 1):
+        print(f"  第 {i} 次搜索板块新闻...")
+        try:
+            params = {
+                "engine": "google",
+                "q": query,
+                "api_key": os.getenv("SERPAPI_API_KEY"),
+                "gl": "US",
+                "hl": "en",
+                "num": 5,
+                "tbs": "qdr:d"  # 限制为今天的新闻
+            }
+
+            base_url = "https://serpapi.com/search"
+            query_string = urlencode(params)
+            search_url = f"{base_url}?{query_string}"
+
+            response = requests.get(search_url, timeout=30)
+            if response.status_code == 200:
+                results = response.json()
+
+                if "organic_results" in results:
+                    articles = results["organic_results"]
+                    for article in articles[:5]:  # 每次搜索取前 5 篇
+                        title = article.get("title", "")
+                        snippet = article.get("snippet", "")
+                        link = article.get("link", "")
+                        source = article.get("source", "Unknown Source")
+
+                        if title and snippet:
+                            article_obj = {
+                                "title": title,
+                                "snippet": snippet,
+                                "link": link,
+                                "source": source,
+                                "type": "rising" if i == 1 else "falling"
+                            }
+                            sector_news["raw_articles"] = sector_news.get("raw_articles", [])
+                            sector_news["raw_articles"].append(article_obj)
+
+                    print(f"  第 {i} 次搜索找到 {len(articles)} 条板块相关资讯")
+            else:
+                print(f"  搜索板块新闻时 HTTP 错误：{response.status_code}")
+
+        except Exception as e:
+            print(f"  搜索板块新闻时出错：{str(e)}")
+
+        if i < len(queries):
+            time.sleep(2)
+
+    return sector_news
+
+def summarize_sectors_with_deepseek(raw_articles):
+    """使用 DeepSeek 整理总结涨跌板块"""
+    print("正在使用 DeepSeek 整理涨跌板块信息...")
+
+    if not raw_articles:
+        return {
+            "rising_sectors": ["无数据"] * 5,
+            "falling_sectors": ["无数据"] * 3
+        }
+
+    # 准备新闻内容
+    articles_text = ""
+    for article in raw_articles:
+        articles_text += f"标题：{article['title']}\n摘要：{article['snippet']}\n来源：{article['source']}\n\n"
+
+    prompt = f"""
+    请根据以下美股新闻内容，总结昨夜今晨的美股板块表现，提取 5 个上涨板块和 3 个下跌板块。
+
+    新闻内容：
+    {articles_text}
+
+    请按照以下格式返回（只返回板块名称，用逗号分隔）：
+    上涨板块：[板块 1],[板块 2],[板块 3],[板块 4],[板块 5]
+    下跌板块：[板块 1],[板块 2],[板块 3]
+
+    如果没有明确提到 5 个上涨或 3 个下跌板块，请根据新闻内容合理推断补充。
+    """
+
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "deepseek-chat",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3,
+        "max_tokens": 500
+    }
+
+    try:
+        response = requests.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=60)
+        response.raise_for_status()
+        result = response.json()['choices'][0]['message']['content']
+
+        # 解析返回结果
+        rising_sectors = []
+        falling_sectors = []
+
+        for line in result.strip().split('\n'):
+            if "上涨板块" in line and ":" in line:
+                sectors_part = line.split(":", 1)[1].strip()
+                rising_sectors = [s.strip() for s in sectors_part.split(",") if s.strip()]
+            elif "下跌板块" in line and ":" in line:
+                sectors_part = line.split(":", 1)[1].strip()
+                falling_sectors = [s.strip() for s in sectors_part.split(",") if s.strip()]
+
+        # 确保数量符合要求
+        while len(rising_sectors) < 5:
+            rising_sectors.append("待补充")
+        while len(falling_sectors) < 3:
+            falling_sectors.append("待补充")
+
+        return {
+            "rising_sectors": rising_sectors[:5],
+            "falling_sectors": falling_sectors[:3]
+        }
+
+    except Exception as e:
+        print(f"DeepSeek 总结失败：{str(e)}")
+        return {
+            "rising_sectors": ["无数据"] * 5,
+            "falling_sectors": ["无数据"] * 3
+        }
+
+def format_sector_summary(sector_data):
+    """格式化板块汇总显示"""
+    if not sector_data:
+        return "📊 **板块表现**: 暂无数据\n"
+
+    summary = "📊 **板块表现**\n\n"
+    summary += "🟢 **上涨板块**:\n"
+    for i, sector in enumerate(sector_data.get("rising_sectors", []), 1):
+        if sector and sector not in ["无数据", "待补充"]:
+            summary += f"  {i}. {sector} 📈\n"
+
+    summary += "\n🔴 **下跌板块**:\n"
+    for i, sector in enumerate(sector_data.get("falling_sectors", []), 1):
+        if sector and sector not in ["无数据", "待补充"]:
+            summary += f"  {i}. {sector} 📉\n"
+
+    summary += "\n"
+    return summary
+
 def format_news_summary(news_data):
     """格式化新闻摘要"""
     if not news_data:
@@ -292,9 +452,15 @@ for i, stock in enumerate(portfolio):
 
 # --- 3. 获取相关新闻 ---
 news_data = {}
+sector_data = {}
 if market_data:
     print("正在获取相关新闻信息...")
     news_data = search_news_for_stocks(market_data)
+
+    # 搜索昨夜今晨涨跌板块相关新闻并整理
+    print("\n正在处理板块新闻...")
+    raw_sector_news = search_sector_news()
+    sector_data = summarize_sectors_with_deepseek(raw_sector_news.get("raw_articles", []))
 
 # --- 4. 构建报告内容 ---
 if not market_data:
@@ -316,21 +482,26 @@ else:
     # 添加新闻信息到提示词
     news_summary = format_news_summary(news_data)
 
+    # 添加板块汇总信息
+    sector_summary = format_sector_summary(sector_data)
+
     prompt = f"""
     你是一位专业的美股投资顾问。请根据以下数据和新闻信息，为我生成一份【{datetime.now().strftime('%Y年%m月%d日')}】的美股晨报。
 
+    {sector_summary}
     {portfolio_ui}
 
     {news_summary}
 
     要求：
     1. **市场总览**：一句话总结昨夜整体市场表现。
-    2. **个股点评**：对每只股票结合新闻信息简要分析涨跌原因。
-    3. **新闻影响**：分析新闻对各股票价格变动的可能影响。
-    4. **操作建议**：基于数据分析和新闻信息给出具体操作建议（持有/减仓/加仓/关注）。
-    5. **风险提示**：指出可能影响投资决策的风险因素。
-    6. **风格**：专业、简洁，直接说结论。
-    7. **格式**：使用 Markdown 格式，适合在即时通讯软件中阅读，使用适当的emoji和分隔符。
+    2. **板块表现**：分析上涨和下跌板块的表现及原因。
+    3. **个股点评**：对每只股票结合新闻信息简要分析涨跌原因。
+    4. **新闻影响**：分析新闻对各股票价格变动的可能影响。
+    5. **操作建议**：基于数据分析和新闻信息给出具体操作建议（持有/减仓/加仓/关注）。
+    6. **风险提示**：指出可能影响投资决策的风险因素。
+    7. **风格**：专业、简洁，直接说结论。
+    8. **格式**：使用 Markdown 格式，适合在即时通讯软件中阅读，使用适当的emoji和分隔符,每一部分要用分隔符清晰隔开。
     """
 
     # --- 5. 调用 DeepSeek AI ---
