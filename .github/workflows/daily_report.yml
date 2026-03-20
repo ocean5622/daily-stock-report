@@ -3,7 +3,7 @@ name: Daily Stock Report (DeepSeek)
 on:
   schedule:
     # 每周周二到周六，中国时间早上7点 = UTC时间前一天晚上23点
-    - cron: '0 23 * * 2,3,4,5,6'
+    #- cron: '0 23 * * 2,3,4,5,6'
   workflow_dispatch: # 允许手动点击按钮测试
 
 jobs:
